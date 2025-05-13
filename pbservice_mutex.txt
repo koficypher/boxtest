@@ -1,0 +1,91 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/adrg/xdg"
+	"github.com/pocketbase/pocketbase"
+	"github.com/pocketbase/pocketbase/apis"
+)
+
+var (
+	pbAppMu    *pocketbase.PocketBase
+	pbCancelMu context.CancelFunc
+	pbMutex    sync.Mutex // Add this for race protection
+)
+
+func runPBWithMU() {
+	// Configure data directory
+	dataDir := filepath.Join(xdg.DataHome, "BoxTest", "pb_data")
+	if os.Getenv("APP_ENV") == "development" {
+		dataDir = "./pb_data"
+	}
+
+	// Protected cancel assignment
+	pbMutex.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	pbCancelMu = cancel
+	pbMutex.Unlock()
+
+	go func() {
+		//pbApp := pocketbase.New()
+
+		// Initialize PocketBase
+		app := pocketbase.NewWithConfig(pocketbase.Config{
+			DefaultDataDir: dataDir,
+		})
+		pbAppMu.Bootstrap()
+
+		// Protected assignment to pbApp
+		pbMutex.Lock()
+		pbApp = app
+		pbMutex.Unlock()
+
+		if err := apis.Serve(pbApp, apis.ServeConfig{
+			HttpAddr:        "127.0.0.1:8090",
+			ShowStartBanner: false,
+		}); err != nil && err != http.ErrServerClosed {
+			appLogger.Fatal(fmt.Sprintf("PocketBase failed: %v", err))
+		}
+	}()
+
+	// Graceful shutdown listener
+	go func() {
+		<-ctx.Done()
+		shutdownPBWithMU()
+	}()
+}
+
+// Add this function to resolve pbCancel warning
+func StopPBWithMU() {
+	if pbCancelMu != nil {
+		pbCancelMu() // Now properly used
+	}
+}
+
+func shutdownPBWithMU() {
+	pbMutex.Lock()
+	defer pbMutex.Unlock()
+
+	if pbAppMu == nil {
+		return
+	}
+
+	// Graceful server shutdown
+	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := pbAppMu.ResetBootstrapState(); err != nil {
+		appLogger.Error(fmt.Sprintf("Cleanup error: %v", err))
+	}
+
+	// Clear references
+	pbApp = nil
+	pbCancel = nil
+}

@@ -1,0 +1,198 @@
+package main
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/adrg/xdg"
+)
+
+//go:embed db/pocketbase.exe db/pb_migrations/*
+var pocketBaseAssets embed.FS
+
+var (
+	pocketBaseCmd *exec.Cmd
+	shutdownOnce  sync.Once
+	logWriter     io.Writer
+)
+
+func extractAndRunPocketBase() {
+	// Determine environment
+	isDevelopment := os.Getenv("APP_ENV") == "development"
+
+	var pbDataDir, binaryDir string
+
+	if isDevelopment {
+		binaryDir = "./db"
+		pbDataDir = filepath.Join(binaryDir, "pb_data")
+	} else {
+		binaryDir = filepath.Join(xdg.DataHome, "BoxTest")
+		pbDataDir = filepath.Join(binaryDir, "pb_data")
+	}
+
+	// Ensure directories exist
+	if err := os.MkdirAll(pbDataDir, 0755); err != nil {
+		appLogger.Error(fmt.Sprintf("Failed to create pb_data directory: %v", err))
+		return
+	}
+
+	// Extract PocketBase binary
+	binaryPath := filepath.Join(binaryDir, "pocketbase.exe")
+	if err := extractBinary(binaryPath); err != nil {
+		appLogger.Error(fmt.Sprintf("Failed to extract PocketBase binary: %v", err))
+		return
+	}
+
+	// Copy migrations and hooks in production
+	if !isDevelopment {
+		if err := copyAssets(binaryDir); err != nil {
+			appLogger.Error(fmt.Sprintf("Failed to copy assets: %v", err))
+			return
+		}
+	}
+
+	// Run PocketBase in a goroutine
+	go func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		pocketBaseCmd = exec.CommandContext(ctx, binaryPath, "serve", "--dir", pbDataDir)
+		pocketBaseCmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: 0x08000000,
+		}
+
+		// Redirect output to logger
+		if logWriter != nil {
+			pocketBaseCmd.Stdout = logWriter
+			pocketBaseCmd.Stderr = logWriter
+		}
+
+		if err := pocketBaseCmd.Start(); err != nil {
+			appLogger.Error(fmt.Sprintf("Failed to start PocketBase: %v", err))
+			return
+		}
+
+		appLogger.Info(fmt.Sprintf("PocketBase started (PID: %d)", pocketBaseCmd.Process.Pid))
+
+		// Wait for process completion
+		if err := pocketBaseCmd.Wait(); err != nil {
+			appLogger.Error(fmt.Sprintf("PocketBase exited with error: %v", err))
+		}
+	}()
+}
+
+func extractBinary(binaryPath string) error {
+	binaryData, err := pocketBaseAssets.ReadFile("db/pocketbase.exe")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(binaryPath, binaryData, 0755)
+}
+
+func copyAssets(binaryDir string) error {
+	for _, folder := range []string{"pb_migrations"} {
+		srcFolder := "db/" + folder
+		destFolder := filepath.Join(binaryDir, folder)
+
+		if err := fs.WalkDir(pocketBaseAssets, srcFolder, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+
+			relPath, _ := filepath.Rel(srcFolder, path)
+			destPath := filepath.Join(destFolder, relPath)
+
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				return err
+			}
+
+			fileData, err := pocketBaseAssets.ReadFile(path)
+			if err != nil {
+				return err
+			}
+
+			return os.WriteFile(destPath, fileData, 0644)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func shutdownPocketBase() {
+	shutdownOnce.Do(func() {
+		if pocketBaseCmd == nil || pocketBaseCmd.Process == nil {
+			return
+		}
+
+		appLogger.Info("Initiating PocketBase shutdown...")
+
+		// Record shutdown start time
+		shutdownStart := time.Now()
+
+		// Try to terminate process
+		err := pocketBaseCmd.Process.Kill()
+		if err != nil {
+			if isProcessRunning(pocketBaseCmd.Process.Pid) {
+				appLogger.Error(fmt.Sprintf("Failed to terminate process: %v", err))
+			} else {
+				appLogger.Debug("Process already exited")
+			}
+			return
+		}
+
+		// Wait for exit with timeout
+		done := make(chan error)
+		go func() { done <- pocketBaseCmd.Wait() }()
+
+		select {
+		case <-time.After(3 * time.Second):
+			if isProcessRunning(pocketBaseCmd.Process.Pid) {
+				appLogger.Warning("Shutdown timeout - process may still be running")
+			} else {
+				appLogger.Info(fmt.Sprintf("Shutdown completed in %v", time.Since(shutdownStart)))
+			}
+		case err := <-done:
+			if err != nil {
+				// Handle Windows-specific exit code
+				if runtime.GOOS == "windows" {
+					if exiterr, ok := err.(*exec.ExitError); ok {
+						if exiterr.ExitCode() == 1 {
+							appLogger.Info("PocketBase terminated successfully (Windows expected exit)")
+							return
+						}
+					}
+				}
+				appLogger.Error(fmt.Sprintf("Unexpected exit: %v", err))
+			} else {
+				appLogger.Info("PocketBase exited cleanly")
+			}
+		}
+	})
+}
+
+// Windows-specific process check
+func isProcessRunning(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// SetLoggerWriter sets the io.Writer for PocketBase output redirection
+func SetLoggerWriter(writer io.Writer) {
+	logWriter = writer
+}

@@ -1,0 +1,132 @@
+package main
+
+import (
+	"embed"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"syscall"
+
+	"github.com/adrg/xdg"
+)
+
+// Embed the PocketBase binary.
+//
+// Embed the PocketBase binary and related files.
+// 
+//
+//go:embed db/pocketbase.exe db/pb_hooks/* db/pb_migrations/*
+var pocketBaseAssets embed.FS
+
+var pocketBaseCmd *exec.Cmd
+var shutdownOnce sync.Once
+
+func extractAndRunPocketBase() {
+	os.Setenv("APP_ENV", "development")
+	// Determine if the app is running in development or production
+	isDevelopment := os.Getenv("APP_ENV") == "development"
+
+	var pbDataDir, binaryDir, binaryPath string
+
+	if isDevelopment {
+		// Use the "db" directory during development
+		binaryDir = "./db"
+		pbDataDir = filepath.Join(binaryDir, "pb_data")
+	} else {
+		// Use the AppData directory during production
+		binaryDir = filepath.Join(xdg.DataHome, "BoxTest")
+		pbDataDir = filepath.Join(binaryDir, "pb_data")
+	}
+
+	// Ensure the pb_data directory exists
+	err := os.MkdirAll(pbDataDir, os.ModePerm)
+	if err != nil {
+		// appLogger.Printf("Failed to create pb_data directory: %v", err)
+
+		return
+	}
+
+	// Extract the PocketBase binary
+	binaryPath = filepath.Join(binaryDir, "pocketbase.exe")
+	binaryData, err := pocketBaseAssets.ReadFile("db/pocketbase.exe")
+	if err != nil {
+		appLogger.Error(fmt.Sprintf("Failed to read embedded PocketBase binary: %v", err))
+		return
+	}
+
+	err = os.WriteFile(binaryPath, binaryData, 0755) // Ensure the binary is executable
+	if err != nil {
+		appLogger.Error(fmt.Sprintf("Failed to write PocketBase binary to file: %v", err))
+		return
+	}
+
+	// Copy pb_migrations and pb_hooks to the production directory
+	if !isDevelopment {
+		//for _, folder := range []string{"pb_migrations", "pb_hooks"} {
+		for _, folder := range []string{"pb_migrations"} {
+			folderPath := filepath.Join(binaryDir, folder)
+			err := os.MkdirAll(folderPath, os.ModePerm)
+			if err != nil {
+				appLogger.Error(fmt.Sprintf("Failed to create directory %s: %v", folderPath, err))
+				continue
+			}
+
+			err = fs.WalkDir(pocketBaseAssets, "db/"+folder, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if d.IsDir() {
+					return nil
+				}
+
+				relPath, _ := filepath.Rel("db", path)
+				destPath := filepath.Join(binaryDir, relPath)
+
+				fileData, err := pocketBaseAssets.ReadFile(path)
+				if err != nil {
+					appLogger.Error(fmt.Sprintf("Failed to read file %s: %v", path, err))
+					return err
+				}
+
+				return os.WriteFile(destPath, fileData, 0644)
+			})
+
+			if err != nil {
+				appLogger.Error(fmt.Sprintf("Failed to copy %s: %v", folder, err))
+			}
+		}
+	}
+
+	// Run the PocketBase binary
+	pocketBaseCmd = exec.Command(binaryPath, "serve", "--dir", pbDataDir)
+	pocketBaseCmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000,
+	}
+	pocketBaseCmd.Stdout = os.Stdout
+	pocketBaseCmd.Stderr = os.Stderr
+
+	err = pocketBaseCmd.Start()
+	if err != nil {
+		appLogger.Error(fmt.Sprintf("Failed to start PocketBase: %v", err))
+		return
+	}
+
+	appLogger.Info(fmt.Sprintf("PocketBase started successfully. Data directory: %s", pbDataDir))
+}
+
+func shutdownPocketBase() {
+	shutdownOnce.Do(func() {
+		if pocketBaseCmd != nil && pocketBaseCmd.Process != nil {
+			err := pocketBaseCmd.Process.Kill()
+			if err != nil {
+				appLogger.Error(fmt.Sprintf("Failed to terminate PocketBase process: %v", err))
+			} else {
+				appLogger.Info("PocketBase process terminated successfully.")
+			}
+		}
+	})
+}

@@ -1,0 +1,93 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/adrg/xdg"
+	"github.com/pocketbase/pocketbase"
+	_ "github.com/pocketbase/pocketbase/apis"
+	"github.com/pocketbase/pocketbase/cmd"
+	_ "github.com/pocketbase/pocketbase/core"
+)
+
+var pbApp *pocketbase.PocketBase // Global variable to hold PocketBase instance
+
+func runPB() {
+	// Resolve a writable directory in %APPDATA%
+	appDataPath := filepath.Join(xdg.DataHome, "BoxTest", "pb_data")
+
+	// Ensure the directory exists
+	err := os.MkdirAll(appDataPath, os.ModePerm)
+	if err != nil {
+		fmt.Printf("Failed to create pb_data directory: %v\n", err)
+		return
+	}
+
+	// Initialize PocketBase with custom configuration
+	pbApp = pocketbase.NewWithConfig(pocketbase.Config{
+		HideStartBanner: false,
+		DefaultDataDir:  appDataPath, // Set the PocketBase data directory here
+	})
+
+	// Redirect PocketBase's stdout/stderr to your custom logger
+	pbApp.RootCmd.SetOut(io.Discard) // Discard default stdout
+	pbApp.RootCmd.SetErr(io.Discard) // Discard default stderr
+
+	fmt.Printf("PB Data Directory set to: %s\n", appDataPath)
+
+	// Bootstrap PocketBase (initialize everything)
+	if err := pbApp.Bootstrap(); err != nil {
+		appLogger.Error(fmt.Sprintf("PocketBase Bootstrap Error: %v", err))
+		return
+	}
+
+	// Serve static files (if needed for assets or public files)
+	// pbApp.OnServe().BindFunc(func(se *core.ServeEvent) error {
+	// 	se.Router.GET("/{path...}", apis.Static(os.DirFS("./pb_public"), false))
+	// 	return se.Next()
+	// })
+
+	// Run the PocketBase server
+	// err = app.Bootstrap()
+	// if err != nil {
+	// 	appLogger.Error(fmt.Sprintf("PocketBase Bootstrap Error: %v", err))
+	// 	return
+	// }
+
+	// Serve the application
+	// Create and execute the serve command
+	// serveCmd := cmd.NewServeCommand(app, true)
+	// if err := serveCmd.Execute(); err != nil {
+	// 	appLogger.Fatal(fmt.Sprintf("PocketBase Serve Error: %v", err))
+	// }
+
+	// Start PocketBase in a goroutine
+	// go func() {
+	// 	if err := pbApp.Start(); err != nil {
+	// 		appLogger.Fatal(fmt.Sprintf("PocketBase Start Error: %v", err))
+	// 	}
+	// 	appLogger.Info("PocketBase started successfully.")
+	// }()
+
+	// Start PocketBase in a goroutine using the serve command
+	go func() {
+		serveCmd := cmd.NewServeCommand(pbApp, true)
+		serveCmd.SetOut(appLogger.logger.Writer()) // Redirect stdout to your logger
+		serveCmd.SetErr(appLogger.logger.Writer()) // Redirect stderr to your logger
+		if err := serveCmd.Execute(); err != nil {
+			appLogger.Fatal(fmt.Sprintf("PocketBase Serve Error: %v", err))
+		}
+		appLogger.Info("PocketBase started successfully.")
+	}()
+}
+
+// // Helper function to access the database for cleanup
+// func getPocketBaseDB() *core.DB {
+// 	if pbApp == nil {
+// 		return nil
+// 	}
+// 	return pbApp.DB()
+// }
