@@ -1,5 +1,7 @@
 # BoxTest
 
+Boxtest is a wails app integrated with pocketbase and vuejs with typescript. It allows for rapid desktop application development leveraging on Go and Vue technologies.  
+
 ## About
 
 This is the official Wails Vue-TS template.
